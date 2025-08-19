@@ -1,0 +1,5 @@
+[console_scripts]
+calc_rem_hours_test=scripts:rem_hours_per_day_test
+parse_test=scripts:parse_test
+test=scripts:test
+

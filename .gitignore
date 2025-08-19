@@ -1,0 +1,22 @@
+'EOF'
+# ---- Frontend (Vite/React) ----
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.log
+
+# ---- Python backend ----
+backend/__pycache__/
+backend/*.pyc
+backend/.venv/
+backend/venv/
+backend/.env
+backend/instance/
+backend/uploads/
+backend/.pytest_cache/
+
+# ---- General ----
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
