@@ -3,7 +3,7 @@
 
 SETLOCAL
 
-SET "NODE_EXE=%~dp0\node.exe"
+SET "NODE_EXE=%~dp0node.exe"
 IF NOT EXIST "%NODE_EXE%" (
   SET "NODE_EXE=node"
 )

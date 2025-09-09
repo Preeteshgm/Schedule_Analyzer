@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
-import ActivitiesPage from './ActivitiesPage'
+import EnhancedActivitiesPage from './EnhancedActivitiesPage'
+import GanttChart from './GanttChart'
 
 interface Project {
     id: number
@@ -12,24 +13,27 @@ interface Project {
 }
 
 interface Schedule {
-    id: number
-    name: string
-    description: string
-    project_id: number
-    file_name?: string
-    file_size?: number
-    total_activities: number
-    total_relationships: number
-    project_start_date?: string
-    project_finish_date?: string
-    data_date?: string
-    status: string
-    created_date: string
-    created_by: string
+    id: number;
+    name: string;
+    description: string;
+    project_id: number;
+    file_name?: string;
+    file_size?: number;
+    total_activities: number;
+    total_relationships: number;
+    total_wbs_items: number;
+    project_start_date?: string;
+    project_finish_date?: string;
+    data_date?: string;
+    proj_id: string;
+    proj_short_name: string;
+    status: string;
+    created_date: string;
+    created_by: string;
 }
 
 function App() {
-    const [currentView, setCurrentView] = useState<'projects' | 'schedules' | 'activities'>('projects')
+    const [currentView, setCurrentView] = useState<'projects' | 'schedules' | 'activities' | 'gantt'>('projects')
     const [selectedProject, setSelectedProject] = useState<Project | null>(null)
     const [selectedSchedule, setSelectedSchedule] = useState<Schedule | null>(null)
 
@@ -300,6 +304,12 @@ function App() {
         setCurrentView('activities')
     }
 
+    const viewScheduleGantt = (schedule: Schedule) => {
+        console.log('Viewing Gantt chart for schedule:', schedule)
+        setSelectedSchedule(schedule)
+        setCurrentView('gantt')
+    }
+
     const backToProjects = () => {
         setCurrentView('projects')
         setSelectedProject(null)
@@ -412,7 +422,7 @@ function App() {
                                 {selectedProject?.name} - Schedules
                             </a>
                             {' > '}
-                            <span>{selectedSchedule?.name} - Activities</span>
+                            <span>{selectedSchedule?.name} - {currentView === 'activities' ? 'Activities' : 'Gantt Chart'}</span>
                         </span>
                     )}
                 </div>
@@ -867,25 +877,47 @@ function App() {
 
                                         <div style={{ marginLeft: '15px' }}>
                                             {schedule.status === 'parsed' && schedule.total_activities > 0 && (
-                                                <button
-                                                    onClick={() => {
-                                                        console.log('Button clicked! Schedule:', schedule)
-                                                        viewScheduleActivities(schedule)
-                                                    }}
-                                                    style={{
-                                                        padding: '8px 12px',
-                                                        backgroundColor: '#007bff',
-                                                        color: 'white',
-                                                        border: 'none',
-                                                        borderRadius: '3px',
-                                                        cursor: 'pointer',
-                                                        marginBottom: '5px',
-                                                        display: 'block',
-                                                        width: '100%'
-                                                    }}
-                                                >
-                                                    📊 View Activities
-                                                </button>
+                                                <>
+                                                    <button
+                                                        onClick={() => {
+                                                            console.log('View Activities button clicked! Schedule:', schedule)
+                                                            viewScheduleActivities(schedule)
+                                                        }}
+                                                        style={{
+                                                            padding: '8px 12px',
+                                                            backgroundColor: '#007bff',
+                                                            color: 'white',
+                                                            border: 'none',
+                                                            borderRadius: '3px',
+                                                            cursor: 'pointer',
+                                                            marginBottom: '5px',
+                                                            display: 'block',
+                                                            width: '100%'
+                                                        }}
+                                                    >
+                                                        📊 View Activities
+                                                    </button>
+
+                                                    <button
+                                                        onClick={() => {
+                                                            console.log('View Gantt button clicked! Schedule:', schedule)
+                                                            viewScheduleGantt(schedule)
+                                                        }}
+                                                        style={{
+                                                            padding: '8px 12px',
+                                                            backgroundColor: '#28a745',
+                                                            color: 'white',
+                                                            border: 'none',
+                                                            borderRadius: '3px',
+                                                            cursor: 'pointer',
+                                                            marginBottom: '5px',
+                                                            display: 'block',
+                                                            width: '100%'
+                                                        }}
+                                                    >
+                                                        📈 Gantt Chart
+                                                    </button>
+                                                </>
                                             )}
 
                                             <button
@@ -912,9 +944,17 @@ function App() {
                 </>
             )}
 
-            {/* Activities View - NEW PAGE */}
+            {/* Activities View - Enhanced Activities Page */}
             {currentView === 'activities' && selectedSchedule && (
-                <ActivitiesPage
+                <EnhancedActivitiesPage
+                    schedule={selectedSchedule}
+                    onBackToSchedules={backToSchedules}
+                />
+            )}
+
+            {/* Gantt Chart View - NEW */}
+            {currentView === 'gantt' && selectedSchedule && (
+                <GanttChart
                     schedule={selectedSchedule}
                     onBackToSchedules={backToSchedules}
                 />

@@ -6,10 +6,15 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from config import Config
 
-from xerparser import Xer
+import pandas as pd
+from anytree import Node, RenderTree
+
 import pandas as pd
 from datetime import datetime as dt
 import tempfile
+
+from core.file_processor import create_file_processor
+from core.xer_data_mapper import create_xer_data_mapper, validate_db_models
 
 # Initialize extensions
 db = SQLAlchemy()
@@ -58,19 +63,22 @@ class Schedule(db.Model):
     file_size = db.Column(db.Integer)      # File size in bytes
     total_activities = db.Column(db.Integer, default=0)
     total_relationships = db.Column(db.Integer, default=0)
+    total_wbs_items = db.Column(db.Integer, default=0)  # NEW: Track WBS count
     project_start_date = db.Column(db.DateTime)
     project_finish_date = db.Column(db.DateTime)
     data_date = db.Column(db.DateTime)     # Schedule data date
-    status = db.Column(db.String(50), default='imported')  # imported, analyzing, ready, error
+    proj_id = db.Column(db.String(50))     # NEW: P6 Project ID from XER
+    proj_short_name = db.Column(db.String(255))  # NEW: P6 Project short name
+    status = db.Column(db.String(50), default='imported')  # imported, parsing, parsed, error
     created_date = db.Column(db.DateTime, default=datetime.utcnow)
     created_by = db.Column(db.String(100))
+    
+    # Relationships
+    project = db.relationship("Project", back_populates="schedules")
     activities = db.relationship("Activity", back_populates="schedule", cascade="all, delete-orphan")
     relationships = db.relationship("Relationship", back_populates="schedule", cascade="all, delete-orphan") 
     wbs_items = db.relationship("WBS", back_populates="schedule", cascade="all, delete-orphan")
     assessment_results = db.relationship("AssessmentResult", back_populates="schedule", cascade="all, delete-orphan")
-    
-    # Relationship to project
-    project = db.relationship("Project", back_populates="schedules")
     
     def to_dict(self):
         return {
@@ -82,16 +90,15 @@ class Schedule(db.Model):
             'file_size': self.file_size,
             'total_activities': self.total_activities,
             'total_relationships': self.total_relationships,
+            'total_wbs_items': self.total_wbs_items,
             'project_start_date': self.project_start_date.isoformat() if self.project_start_date else None,
             'project_finish_date': self.project_finish_date.isoformat() if self.project_finish_date else None,
             'data_date': self.data_date.isoformat() if self.data_date else None,
+            'proj_id': self.proj_id,
+            'proj_short_name': self.proj_short_name,
             'status': self.status,
             'created_date': self.created_date.isoformat(),
-            'created_by': self.created_by,
-            'activity_count': len(self.activities) if self.activities else 0,
-            'relationship_count': len(self.relationships) if self.relationships else 0,
-            'wbs_count': len(self.wbs_items) if self.wbs_items else 0,
-            'assessment_count': len(self.assessment_results) if self.assessment_results else 0
+            'created_by': self.created_by
         }
 
 class Activity(db.Model):
@@ -99,32 +106,74 @@ class Activity(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     schedule_id = db.Column(db.Integer, db.ForeignKey('schedules.id'), nullable=False)
-    task_id = db.Column(db.String(50), nullable=False)         # P6 Activity ID
+    task_id = db.Column(db.String(50), nullable=False)
     task_name = db.Column(db.Text)
-    wbs_id = db.Column(db.String(50))                          # Links to WBS.wbs_id
+    task_code = db.Column(db.String(100))
+    activity_code = db.Column(db.String(50))                   # Existing: Generated activity code
+    wbs_id = db.Column(db.String(50))
+    wbs_code = db.Column(db.String(50))                        # Existing: Parent WBS code reference
+    proj_id = db.Column(db.String(50))
+    sort_order = db.Column(db.Integer, default=0)              # Existing: For maintaining order
+    
+    # Duration fields
     duration_days = db.Column(db.Float, default=0)
     total_float_days = db.Column(db.Float, default=0)
     free_float_days = db.Column(db.Float, default=0)
+    
+    # Existing date fields
     early_start_date = db.Column(db.DateTime)
     early_end_date = db.Column(db.DateTime)
     late_start_date = db.Column(db.DateTime)
     late_end_date = db.Column(db.DateTime)
     actual_start_date = db.Column(db.DateTime)
     actual_end_date = db.Column(db.DateTime)
+    
+    # Progress fields
     progress_pct = db.Column(db.Float, default=0)
     task_type = db.Column(db.String(50))
     status_code = db.Column(db.String(50))
+    hierarchy_path = db.Column(db.Text)
+    
+    # Existing enhanced fields (if you had any)
+    baseline_start_date = db.Column(db.DateTime)               # Existing
+    baseline_finish_date = db.Column(db.DateTime)              # Existing (if you have this)
+    constraint_type = db.Column(db.String(50))                 # Existing
+    constraint_date = db.Column(db.DateTime)                   # Existing
+    calendar_id = db.Column(db.String(50))                     # Existing (if you have this)
+    cost_account = db.Column(db.String(100))                   # Existing (if you have this)
+    responsible_manager = db.Column(db.String(100))            # Existing (if you have this)
+    priority_type = db.Column(db.Integer)                      # Existing (if you have this)
+    suspend_date = db.Column(db.DateTime)                      # Existing (if you have this)
+    resume_date = db.Column(db.DateTime)                       # Existing (if you have this)
+    additional_data = db.Column(db.JSON)                       # Existing (if you have this)
+    
+    # *** NEW ENHANCED FIELDS - ADD THESE ***
+    activity_codes = db.Column(db.JSON)                        # NEW: Activity code assignments
+    udf_values = db.Column(db.JSON)                            # NEW: User-defined field values
+    target_start_date = db.Column(db.DateTime)                 # NEW: Target/planned start
+    target_end_date = db.Column(db.DateTime)                   # NEW: Target/planned end
+    baseline_end_date = db.Column(db.DateTime)                 # NEW: Baseline end date
+    remaining_duration = db.Column(db.Float, default=0)        # NEW: Remaining duration
+    original_duration = db.Column(db.Float, default=0)         # NEW: Original duration
+    percent_complete = db.Column(db.Float, default=0)          # NEW: Alternative progress field
+    resource_names = db.Column(db.String(500))                 # NEW: Assigned resources
     
     # Relationship to schedule
     schedule = db.relationship("Schedule", back_populates="activities")
     
     def to_dict(self):
+        """Enhanced to_dict with all new fields"""
         return {
             'id': self.id,
             'schedule_id': self.schedule_id,
             'task_id': self.task_id,
             'task_name': self.task_name,
+            'task_code': self.task_code,
+            'activity_code': self.activity_code,
             'wbs_id': self.wbs_id,
+            'wbs_code': self.wbs_code,
+            'proj_id': self.proj_id,
+            'sort_order': self.sort_order,
             'duration_days': self.duration_days,
             'total_float_days': self.total_float_days,
             'free_float_days': self.free_float_days,
@@ -136,7 +185,30 @@ class Activity(db.Model):
             'actual_end_date': self.actual_end_date.isoformat() if self.actual_end_date else None,
             'progress_pct': self.progress_pct,
             'task_type': self.task_type,
-            'status_code': self.status_code
+            'status_code': self.status_code,
+            'hierarchy_path': self.hierarchy_path,
+            'baseline_start_date': self.baseline_start_date.isoformat() if self.baseline_start_date else None,
+            'baseline_finish_date': self.baseline_finish_date.isoformat() if self.baseline_finish_date else None,
+            'constraint_type': self.constraint_type,
+            'constraint_date': self.constraint_date.isoformat() if self.constraint_date else None,
+            'calendar_id': self.calendar_id,
+            'cost_account': self.cost_account,
+            'responsible_manager': self.responsible_manager,
+            'priority_type': self.priority_type,
+            'suspend_date': self.suspend_date.isoformat() if self.suspend_date else None,
+            'resume_date': self.resume_date.isoformat() if self.resume_date else None,
+            'additional_data': self.additional_data,
+            
+            # *** NEW ENHANCED FIELDS ***
+            'activity_codes': self.activity_codes,                # NEW
+            'udf_values': self.udf_values,                        # NEW
+            'target_start_date': self.target_start_date.isoformat() if self.target_start_date else None,  # NEW
+            'target_end_date': self.target_end_date.isoformat() if self.target_end_date else None,        # NEW
+            'baseline_end_date': self.baseline_end_date.isoformat() if self.baseline_end_date else None,  # NEW
+            'remaining_duration': self.remaining_duration,        # NEW
+            'original_duration': self.original_duration,          # NEW
+            'percent_complete': self.percent_complete,            # NEW
+            'resource_names': self.resource_names                 # NEW
         }
 
 class Relationship(db.Model):
@@ -168,9 +240,15 @@ class WBS(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     schedule_id = db.Column(db.Integer, db.ForeignKey('schedules.id'), nullable=False)
     wbs_id = db.Column(db.String(50), nullable=False)          # P6 WBS ID (unique within project)
-    wbs_name = db.Column(db.Text)                              # WBS name
-    parent_wbs_id = db.Column(db.String(50))                   # Parent WBS ID (NULL for root)
+    wbs_name = db.Column(db.Text)                              # WBS name/description
+    wbs_short_name = db.Column(db.String(100))                 # WBS code segment (e.g., "G", "G.G", "AC")
+    wbs_code = db.Column(db.String(50))                        # NEW: Hierarchy code (1.0, 1.1, 1.1.1)
+    parent_wbs_id = db.Column(db.String(50))                   # Parent WBS ID (NULL for project root)
     proj_id = db.Column(db.String(50))                         # Project ID from P6
+    proj_node_flag = db.Column(db.String(1))                   # 'Y' if this is project root WBS
+    level = db.Column(db.Integer, default=0)                   # Hierarchy level (0=project, 1=level1, etc.)
+    sort_order = db.Column(db.Integer, default=0)              # NEW: For maintaining order in exports
+    full_path = db.Column(db.Text)                             # Full hierarchy path (e.g., "Project > General > All Clusters")
     
     # Relationship to schedule
     schedule = db.relationship("Schedule", back_populates="wbs_items")
@@ -181,8 +259,14 @@ class WBS(db.Model):
             'schedule_id': self.schedule_id,
             'wbs_id': self.wbs_id,
             'wbs_name': self.wbs_name,
+            'wbs_short_name': self.wbs_short_name,
+            'wbs_code': self.wbs_code,                          # NEW
             'parent_wbs_id': self.parent_wbs_id,
-            'proj_id': self.proj_id
+            'proj_id': self.proj_id,
+            'proj_node_flag': self.proj_node_flag,
+            'level': self.level,
+            'sort_order': self.sort_order,                      # NEW
+            'full_path': self.full_path
         }
 
 class AssessmentResult(db.Model):
@@ -222,416 +306,406 @@ class AssessmentResult(db.Model):
 
 def parse_xer_file(file_path, schedule_id):
     """
-    Enhanced XER parser that properly extracts PROJWBS table for P6 hierarchy
-    Returns: (success: bool, message: str, stats: dict)
+    Enhanced XER parsing using raw parser and data mapper
+    Supports activity codes, UDFs, and enhanced data extraction
     """
     try:
-        print(f"🔄 Enhanced XER parsing with WBS: {file_path}")
+        print(f"🚀 Enhanced XER parsing: {file_path}")
         
-        # Check if file exists
-        if not os.path.exists(file_path):
-            return False, f"File not found: {file_path}", {}
+        # Get schedule from database
+        schedule = Schedule.query.get(schedule_id)
+        if not schedule:
+            return False, "Schedule not found", {}
         
-        # Check file size
-        file_size = os.path.getsize(file_path)
-        print(f"📁 File size: {file_size / 1024 / 1024:.2f} MB")
-        
-        if file_size == 0:
-            return False, "File is empty", {}
-        
-        # STEP 1: Read XER file with proper encoding
-        print("📖 Reading XER file...")
-        
-        encodings_to_try = ['latin-1', 'utf-8', 'cp1252', 'iso-8859-1']
-        successful_encoding = None
-        lines = []
-        
-        for encoding in encodings_to_try:
-            try:
-                print(f"🔤 Trying encoding: {encoding}")
-                with open(file_path, 'r', encoding=encoding) as f:
-                    content = f.read()
-                    lines = content.split('\n')
-                    
-                # Check if it's a valid XER file
-                if lines and lines[0].strip().startswith('ERMHDR'):
-                    print(f"✅ Valid XER file detected with {encoding} encoding")
-                    successful_encoding = encoding
-                    break
-                else:
-                    print(f"❌ {encoding}: File doesn't start with ERMHDR")
-                    
-            except UnicodeDecodeError:
-                print(f"❌ {encoding} failed: UnicodeDecodeError")
-                continue
-            except Exception as e:
-                print(f"❌ {encoding} failed with error: {e}")
-                continue
-        
-        if not successful_encoding:
-            return False, "Unable to read XER file with any supported encoding", {}
-        
-        print(f"📄 Successfully read {len(lines)} lines")
-        
-        # STEP 2: Parse XER structure
-        print("🏗️ Parsing XER structure...")
-        
-        current_table = None
-        tables = {}
-        
-        for line_num, line in enumerate(lines):
-            line = line.strip()
-            if not line:
-                continue
-                
-            if line.startswith('%T'):
-                # Table start: %T<TAB>TABLE_NAME
-                parts = line.split('\t')
-                if len(parts) >= 2:
-                    current_table = parts[1]
-                    tables[current_table] = {'columns': [], 'data': []}
-                    print(f"📋 Found table: {current_table}")
-                    
-            elif line.startswith('%F') and current_table:
-                # Field definition: %F<TAB>FIELD_NAME<TAB>DATA_TYPE
-                parts = line.split('\t')
-                if len(parts) >= 2:
-                    field_name = parts[1]
-                    tables[current_table]['columns'].append(field_name)
-                    
-            elif line.startswith('%R') and current_table:
-                # Data row: %R<TAB>VALUE1<TAB>VALUE2<TAB>...
-                parts = line.split('\t')[1:]  # Skip %R
-                tables[current_table]['data'].append(parts)
-                
-            elif line.startswith('%E'):
-                # Table end
-                if current_table:
-                    print(f"✅ Completed table {current_table}: {len(tables[current_table]['data'])} rows")
-                current_table = None
-        
-        print(f"📊 Parsed {len(tables)} tables from XER file")
-        print(f"📋 Available tables: {list(tables.keys())}")
-        
-        # STEP 3: Extract PROJECT information
-        print("📋 Extracting project information...")
-        project_info = {'name': 'Imported Project', 'proj_id': None}
-        
-        if 'PROJECT' in tables:
-            project_table = tables['PROJECT']
-            if project_table['data']:
-                col_map = {col: i for i, col in enumerate(project_table['columns'])}
-                first_project = project_table['data'][0]
-                
-                project_info = {
-                    'name': first_project[col_map.get('proj_short_name', 0)] if 'proj_short_name' in col_map else 'Imported Project',
-                    'proj_id': first_project[col_map.get('proj_id', 0)] if 'proj_id' in col_map else None
-                }
-                
-                print(f"📊 Project: {project_info['name']} (ID: {project_info['proj_id']})")
-        
-        # STEP 4: Extract PROJWBS (THE CRITICAL TABLE FOR HIERARCHY!)
-        print("🏗️ Extracting PROJWBS (WBS hierarchy)...")
-        wbs_items = []
-        
-        if 'PROJWBS' in tables:
-            wbs_table = tables['PROJWBS']
-            col_map = {col: i for i, col in enumerate(wbs_table['columns'])}
-            
-            print(f"📁 PROJWBS columns: {wbs_table['columns']}")
-            print(f"🏗️ Processing {len(wbs_table['data'])} WBS items...")
-            
-            for row_num, row in enumerate(wbs_table['data']):
-                if row_num % 1000 == 0 and row_num > 0:
-                    print(f"   Processing WBS item {row_num}...")
-                
-                try:
-                    # Helper function to safely get values
-                    def get_value(col_name, default=''):
-                        try:
-                            if col_name in col_map and col_map[col_name] < len(row):
-                                val = row[col_map[col_name]].strip()
-                                return val if val else default
-                            return default
-                        except:
-                            return default
-                    
-                    wbs_id = get_value('wbs_id')
-                    wbs_name = get_value('wbs_name') or get_value('wbs_short_name', 'Unnamed WBS')
-                    parent_wbs_id = get_value('parent_wbs_id')
-                    proj_id = get_value('proj_id', project_info.get('proj_id', ''))
-                    
-                    # Handle empty parent_wbs_id (root level)
-                    if not parent_wbs_id or parent_wbs_id == proj_id:
-                        parent_wbs_id = None
-                    
-                    if not wbs_id:  # Skip rows without wbs_id
-                        continue
-                    
-                    wbs_item = WBS(
-                        schedule_id=schedule_id,
-                        wbs_id=wbs_id,
-                        wbs_name=wbs_name,
-                        parent_wbs_id=parent_wbs_id,
-                        proj_id=proj_id
-                    )
-                    
-                    wbs_items.append(wbs_item)
-                    
-                except Exception as e:
-                    print(f"⚠️ Error processing WBS row {row_num}: {e}")
-                    continue
-            
-            print(f"✅ Successfully processed {len(wbs_items)} WBS items")
-        else:
-            print("⚠️ No PROJWBS table found in XER file")
-        
-        # STEP 5: Extract TASK (Activities)
-        print("🎯 Extracting activities...")
-        activities_data = []
-        
-        if 'TASK' in tables:
-            task_table = tables['TASK']
-            col_map = {col: i for i, col in enumerate(task_table['columns'])}
-            
-            print(f"📋 TASK columns: {task_table['columns']}")
-            print(f"🎯 Processing {len(task_table['data'])} activities...")
-            
-            for row_num, row in enumerate(task_table['data']):
-                if row_num % 5000 == 0 and row_num > 0:
-                    print(f"   Processing activity {row_num}...")
-                
-                try:
-                    # Helper functions
-                    def get_value(col_name, default=''):
-                        try:
-                            if col_name in col_map and col_map[col_name] < len(row):
-                                val = row[col_map[col_name]].strip()
-                                return val if val else default
-                            return default
-                        except:
-                            return default
-                    
-                    def get_float(col_name, default=0.0):
-                        try:
-                            val = get_value(col_name, '0')
-                            return float(val) if val and val != '' else default
-                        except:
-                            return default
-                    
-                    def get_date(col_name):
-                        try:
-                            val = get_value(col_name)
-                            if val and val != '':
-                                # Try to parse date (P6 dates are usually in YYYY-MM-DD format)
-                                return datetime.strptime(val[:10], '%Y-%m-%d') if len(val) >= 10 else None
-                            return None
-                        except:
-                            return None
-                    
-                    # Extract activity data
-                    task_id = get_value('task_id')
-                    task_name = get_value('task_name')
-                    
-                    if not task_id:  # Skip rows without task_id
-                        continue
-                    
-                    # Convert hours to days (assuming 8-hour days)
-                    duration_hours = get_float('target_drtn_hr_cnt', 0)
-                    duration_days = duration_hours / 8 if duration_hours > 0 else 0
-                    
-                    total_float_hours = get_float('total_float_hr_cnt', 0)
-                    total_float_days = total_float_hours / 8
-                    
-                    free_float_hours = get_float('free_float_hr_cnt', 0)
-                    free_float_days = free_float_hours / 8
-                    
-                    progress_pct = get_float('phys_complete_pct', 0)
-                    
-                    # Extract dates
-                    early_start_date = get_date('early_start_date')
-                    early_end_date = get_date('early_end_date')
-                    late_start_date = get_date('late_start_date')
-                    late_end_date = get_date('late_end_date')
-                    actual_start_date = get_date('act_start_date')
-                    actual_end_date = get_date('act_end_date')
-                    
-                    activity_data = Activity(
-                        schedule_id=schedule_id,
-                        task_id=task_id,
-                        task_name=task_name,
-                        wbs_id=get_value('wbs_id'),
-                        duration_days=duration_days,
-                        total_float_days=total_float_days,
-                        free_float_days=free_float_days,
-                        early_start_date=early_start_date,
-                        early_end_date=early_end_date,
-                        late_start_date=late_start_date,
-                        late_end_date=late_end_date,
-                        actual_start_date=actual_start_date,
-                        actual_end_date=actual_end_date,
-                        progress_pct=progress_pct,
-                        task_type=get_value('task_type'),
-                        status_code=get_value('status_code')
-                    )
-                    
-                    activities_data.append(activity_data)
-                    
-                except Exception as e:
-                    print(f"⚠️ Error processing activity {row_num}: {e}")
-                    continue
-            
-            print(f"✅ Successfully processed {len(activities_data)} activities")
-        else:
-            print("⚠️ No TASK table found in XER file")
-        
-        # STEP 6: Extract TASKPRED (Relationships)
-        print("🔗 Extracting relationships...")
-        relationships_data = []
-        
-        if 'TASKPRED' in tables:
-            rel_table = tables['TASKPRED']
-            col_map = {col: i for i, col in enumerate(rel_table['columns'])}
-            
-            print(f"📋 TASKPRED columns: {rel_table['columns']}")
-            print(f"🔗 Processing {len(rel_table['data'])} relationships...")
-            
-            for row_num, row in enumerate(rel_table['data']):
-                if row_num % 10000 == 0 and row_num > 0:
-                    print(f"   Processing relationship {row_num}...")
-                
-                try:
-                    def get_value(col_name, default=''):
-                        try:
-                            if col_name in col_map and col_map[col_name] < len(row):
-                                val = row[col_map[col_name]].strip()
-                                return val if val else default
-                            return default
-                        except:
-                            return default
-                    
-                    def get_float(col_name, default=0.0):
-                        try:
-                            val = get_value(col_name, '0')
-                            return float(val) if val and val != '' else default
-                        except:
-                            return default
-                    
-                    # Try different possible column names
-                    pred_task_id = (get_value('pred_task_id') or 
-                                  get_value('pred_task_uid') or 
-                                  get_value('predecessor_task_id'))
-                    
-                    task_id = (get_value('task_id') or 
-                              get_value('task_uid') or 
-                              get_value('successor_task_id'))
-                    
-                    # Skip if we don't have both IDs
-                    if not pred_task_id or not task_id:
-                        continue
-                    
-                    # Extract lag and pred_type
-                    lag_hours = get_float('lag_hr_cnt', 0)
-                    lag_days = lag_hours / 8
-                    
-                    pred_type = get_value('pred_type', 'FS')
-                    
-                    relationship_data = Relationship(
-                        schedule_id=schedule_id,
-                        pred_task_id=pred_task_id,
-                        succ_task_id=task_id,
-                        pred_type=pred_type,
-                        lag_days=lag_days
-                    )
-                    
-                    relationships_data.append(relationship_data)
-                    
-                except Exception as e:
-                    print(f"⚠️ Error processing relationship {row_num}: {e}")
-                    continue
-            
-            print(f"✅ Successfully processed {len(relationships_data)} relationships")
-        else:
-            print("⚠️ No TASKPRED table found in XER file")
-        
-        # STEP 7: Save to database with proper order (WBS first, then activities, then relationships)
-        print("💾 Saving to database...")
-        
-        try:
-            # Save WBS items first (they're referenced by activities)
-            if wbs_items:
-                batch_size = 500
-                for i in range(0, len(wbs_items), batch_size):
-                    batch = wbs_items[i:i+batch_size]
-                    db.session.add_all(batch)
-                    db.session.commit()
-                    if len(wbs_items) > batch_size:
-                        print(f"   Saved WBS items: {min(i+batch_size, len(wbs_items))}/{len(wbs_items)}")
-                
-                print(f"✅ Saved all {len(wbs_items)} WBS items")
-            
-            # Save activities (they reference WBS items)
-            if activities_data:
-                batch_size = 500
-                for i in range(0, len(activities_data), batch_size):
-                    batch = activities_data[i:i+batch_size]
-                    db.session.add_all(batch)
-                    db.session.commit()
-                    if len(activities_data) > batch_size:
-                        print(f"   Saved activities: {min(i+batch_size, len(activities_data))}/{len(activities_data)}")
-                
-                print(f"✅ Saved all {len(activities_data)} activities")
-            
-            # Save relationships (they reference activities)
-            if relationships_data:
-                batch_size = 500
-                for i in range(0, len(relationships_data), batch_size):
-                    batch = relationships_data[i:i+batch_size]
-                    db.session.add_all(batch)
-                    db.session.commit()
-                    if len(relationships_data) > batch_size:
-                        print(f"   Saved relationships: {min(i+batch_size, len(relationships_data))}/{len(relationships_data)}")
-                
-                print(f"✅ Saved all {len(relationships_data)} relationships")
-            
-            # Update schedule with parsed information
-            schedule = Schedule.query.get(schedule_id)
-            if schedule:
-                schedule.total_activities = len(activities_data)
-                schedule.total_relationships = len(relationships_data)
-                schedule.status = 'parsed'
-                db.session.commit()
-                
-                print(f"✅ Updated schedule {schedule.id}")
-            
-        except Exception as db_error:
-            print(f"❌ Database save error: {db_error}")
-            import traceback
-            traceback.print_exc()
-            db.session.rollback()
-            return False, f"Database error: {str(db_error)}", {}
-        
-        # STEP 8: Return success with comprehensive stats
-        stats = {
-            'activities': len(activities_data),
-            'relationships': len(relationships_data),
-            'wbs_items': len(wbs_items),
-            'project_name': project_info.get('name', 'Unknown'),
-            'project_id': project_info.get('proj_id'),
-            'encoding_used': successful_encoding,
-            'tables_found': list(tables.keys())
+        # Create database models dictionary
+        db_models = {
+            'db': db,
+            'Activity': Activity,
+            'WBS': WBS,
+            'Relationship': Relationship,
+            'Schedule': Schedule
         }
         
-        print(f"🎉 XER file parsed successfully with complete hierarchy!")
-        print(f"📊 Final stats: {len(activities_data)} activities, {len(relationships_data)} relationships, {len(wbs_items)} WBS items")
+        # Validate database models
+        from core.xer_data_mapper import validate_db_models
+        if not validate_db_models(db_models):
+            return False, "Database models validation failed", {}
         
-        return True, f"XER file parsed successfully! Imported {len(activities_data)} activities, {len(relationships_data)} relationships, and {len(wbs_items)} WBS items with complete P6 hierarchy.", stats
+        # Create file processor
+        from core.file_processor import create_file_processor
+        file_processor = create_file_processor(UPLOAD_FOLDER)
         
+        # Process the file
+        success, message, stats = file_processor.process_file(
+            file_path=file_path,
+            schedule_id=schedule_id,
+            db_models=db_models
+        )
+        
+        if success:
+            print(f"✅ Enhanced parsing successful: {message}")
+            
+            # Add enhanced processing information to stats
+            enhanced_stats = stats.copy()
+            enhanced_stats.update({
+                'parsing_method': 'Enhanced Raw XER Parser',
+                'supports_activity_codes': True,
+                'supports_udfs': True,
+                'supports_enhanced_dates': True,
+                'library_free': True,  # No PyP6Xer dependency
+                'file_size_mb': round(stats.get('file_size_mb', 0), 2)
+            })
+            
+            return success, message, enhanced_stats
+        else:
+            print(f"❌ Enhanced parsing failed: {message}")
+            return success, message, stats
+            
     except Exception as e:
-        print(f"❌ Unexpected error in enhanced XER parser: {e}")
+        print(f"❌ Enhanced XER parsing error: {e}")
         import traceback
         traceback.print_exc()
-        return False, f"Unexpected error: {str(e)}", {}
+        
+        # Update schedule status to error
+        try:
+            schedule = Schedule.query.get(schedule_id)
+            if schedule:
+                schedule.status = 'error'
+                db.session.commit()
+        except:
+            pass
+        
+        return False, f"Enhanced parsing error: {str(e)}", {}
+
+def export_schedule_to_xer(schedule_id, output_path):
+    """
+    Export schedule back to XER format with proper hierarchy codes
+    This maintains the WBS structure and activity codes for P6 compatibility
+    """
+    try:
+        print(f"📤 Exporting schedule {schedule_id} to XER format...")
+        
+        schedule = Schedule.query.get(schedule_id)
+        if not schedule:
+            return False, "Schedule not found"
+        
+        # Get data with proper ordering
+        wbs_items = WBS.query.filter_by(schedule_id=schedule_id).order_by(WBS.sort_order.asc()).all()
+        activities = Activity.query.filter_by(schedule_id=schedule_id).order_by(
+            Activity.wbs_code.asc(), Activity.sort_order.asc()
+        ).all()
+        relationships = Relationship.query.filter_by(schedule_id=schedule_id).all()
+        
+        # Build XER content with proper hierarchy codes
+        xer_content = []
+        
+        # XER Header
+        xer_content.append("ERMHDR\t1.0\t2024\tUNK\tUNK\tUNK")
+        
+        # Project table
+        xer_content.append("%T\tPROJECT")
+        xer_content.append("%F\tproj_id\tproj_short_name\tplan_start_date\tplan_end_date")
+        project_start = schedule.project_start_date.strftime('%Y-%m-%d %H:%M') if schedule.project_start_date else ''
+        project_end = schedule.project_finish_date.strftime('%Y-%m-%d %H:%M') if schedule.project_finish_date else ''
+        xer_content.append(f"%R\t{schedule.proj_id}\t{schedule.proj_short_name}\t{project_start}\t{project_end}")
+        xer_content.append("%E")
+        
+        # WBS table with hierarchy codes
+        xer_content.append("%T\tPROJWBS")
+        xer_content.append("%F\twbs_id\twbs_name\tparent_wbs_id\tproj_id\twbs_short_name\tlevel")
+        for wbs in wbs_items:
+            parent_id = wbs.parent_wbs_id if wbs.parent_wbs_id else ''
+            wbs_code = wbs.wbs_code if wbs.wbs_code else wbs.wbs_short_name
+            xer_content.append(f"%R\t{wbs.wbs_id}\t{wbs.wbs_name}\t{parent_id}\t{wbs.proj_id}\t{wbs_code}\t{wbs.level}")
+        xer_content.append("%E")
+        
+        # Activities table with activity codes
+        xer_content.append("%T\tTASK")
+        xer_content.append("%F\ttask_id\ttask_name\twbs_id\ttask_code\ttarget_drtn_hr_cnt\tearly_start_date\tearly_end_date\tphys_complete_pct\ttotal_float_hr_cnt")
+        for activity in activities:
+            duration_hrs = (activity.duration_days or 0) * 8
+            float_hrs = (activity.total_float_days or 0) * 8
+            early_start = activity.early_start_date.strftime('%Y-%m-%d %H:%M') if activity.early_start_date else ''
+            early_end = activity.early_end_date.strftime('%Y-%m-%d %H:%M') if activity.early_end_date else ''
+            task_code = activity.activity_code if activity.activity_code else activity.task_code
+            xer_content.append(f"%R\t{activity.task_id}\t{activity.task_name}\t{activity.wbs_id}\t{task_code}\t{duration_hrs}\t{early_start}\t{early_end}\t{activity.progress_pct}\t{float_hrs}")
+        xer_content.append("%E")
+        
+        # Relationships table
+        if relationships:
+            xer_content.append("%T\tTASKPRED")
+            xer_content.append("%F\tpred_task_id\ttask_id\tpred_type\tlag_hr_cnt")
+            for rel in relationships:
+                lag_hrs = (rel.lag_days or 0) * 8
+                # Convert back to P6 format
+                pred_type_p6 = f"PR_{rel.pred_type}" if not rel.pred_type.startswith('PR_') else rel.pred_type
+                xer_content.append(f"%R\t{rel.pred_task_id}\t{rel.succ_task_id}\t{pred_type_p6}\t{lag_hrs}")
+            xer_content.append("%E")
+        
+        # Write to file
+        with open(output_path, 'w', encoding='latin-1') as f:
+            f.write('\n'.join(xer_content))
+        
+        print(f"✅ XER export completed: {output_path}")
+        return True, f"Exported to {output_path}"
+        
+    except Exception as e:
+        print(f"❌ XER export error: {e}")
+        return False, f"Export error: {str(e)}"
+    
+def generate_wbs_hierarchy_codes(schedule_id):
+    """
+    Generate hierarchical WBS codes (1.0, 1.1, 1.1.1, etc.)
+    Store them in the database with proper XER export compatibility
+    """
+    try:
+        print("🔢 Generating WBS hierarchy codes...")
+        
+        # Get all WBS items for this schedule
+        wbs_items = WBS.query.filter_by(schedule_id=schedule_id).all()
+        
+        if not wbs_items:
+            print("⚠️ No WBS items found")
+            return False
+        
+        # Create WBS lookup map
+        wbs_map = {wbs.wbs_id: wbs for wbs in wbs_items}
+        
+        # Sort by level and name for consistent ordering
+        wbs_items.sort(key=lambda w: (w.level or 0, w.wbs_name or ''))
+        
+        # Find root WBS items (project level)
+        root_wbs = [wbs for wbs in wbs_items if wbs.proj_node_flag == 'Y' or wbs.level == 0 or not wbs.parent_wbs_id]
+        
+        print(f"🌳 Found {len(root_wbs)} root WBS items")
+        
+        # Assign codes to root items
+        for index, wbs in enumerate(root_wbs):
+            wbs_code = f"{index + 1}.0"
+            wbs.wbs_code = wbs_code
+            wbs.sort_order = index + 1
+            print(f"   📁 {wbs.wbs_name} = {wbs_code}")
+            
+            # Recursively assign codes to children
+            assign_child_wbs_codes(wbs, wbs_code, wbs_map, wbs_items)
+        
+        # Save all WBS updates to database
+        db.session.commit()
+        print(f"✅ Generated and saved WBS codes for {len(wbs_items)} items")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error generating WBS codes: {e}")
+        db.session.rollback()
+        return False
+
+
+def assign_child_wbs_codes(parent_wbs, parent_code, wbs_map, wbs_items):
+    """
+    Recursively assign WBS codes to child WBS items
+    """
+    # Find children of current WBS
+    children = [wbs for wbs in wbs_items if wbs.parent_wbs_id == parent_wbs.wbs_id]
+    
+    # Sort children by name for consistent ordering
+    children.sort(key=lambda w: w.wbs_name or '')
+    
+    for index, child in enumerate(children):
+        # Generate child code
+        if parent_code.endswith('.0'):
+            # Replace .0 with actual number for first level
+            child_code = f"{parent_code[:-2]}.{index + 1}"
+        else:
+            # Append to existing code
+            child_code = f"{parent_code}.{index + 1}"
+        
+        # Store the code
+        child.wbs_code = child_code
+        child.sort_order = index + 1
+        print(f"     📂‚ {child.wbs_name} = {child_code}")
+        
+        # Recursively assign codes to children
+        assign_child_wbs_codes(child, child_code, wbs_map, wbs_items)
+
+
+def generate_activity_codes(schedule_id):
+    """
+    Generate activity codes based on WBS codes (1.1.1.1, 1.1.1.2, etc.)
+    Store them in the activity_code field for XER export compatibility
+    """
+    try:
+        print("🎯 Generating activity codes based on WBS hierarchy...")
+        
+        # Get all activities and WBS items for this schedule
+        activities = Activity.query.filter_by(schedule_id=schedule_id).all()
+        wbs_items = WBS.query.filter_by(schedule_id=schedule_id).all()
+        
+        # Create WBS lookup map with codes
+        wbs_code_map = {wbs.wbs_id: wbs.wbs_code for wbs in wbs_items if wbs.wbs_code}
+        
+        # Group activities by WBS
+        activities_by_wbs = {}
+        for activity in activities:
+            wbs_id = activity.wbs_id
+            if wbs_id not in activities_by_wbs:
+                activities_by_wbs[wbs_id] = []
+            activities_by_wbs[wbs_id].append(activity)
+        
+        # Generate activity codes for each WBS
+        total_coded = 0
+        for wbs_id, wbs_activities in activities_by_wbs.items():
+            wbs_code = wbs_code_map.get(wbs_id)
+            if not wbs_code:
+                print(f"⚠️ No WBS code found for WBS ID: {wbs_id}")
+                continue
+            
+            # Sort activities by start date and task_id for consistent ordering
+            wbs_activities.sort(key=lambda a: (
+                a.early_start_date or datetime(1900, 1, 1),  # 🔗 Fixed
+                a.task_id
+            ))
+            
+            # Assign activity codes
+            for index, activity in enumerate(wbs_activities):
+                activity_code = f"{wbs_code}.{index + 1}"
+                activity.activity_code = activity_code
+                activity.wbs_code = wbs_code  # Store reference to parent WBS code
+                activity.sort_order = index + 1
+                total_coded += 1
+                
+                if index < 3:  # Show first 3 for debugging
+                    print(f"     🎯 {activity.task_name[:30]}... = {activity_code}")
+        
+        # Save all activity updates to database
+        db.session.commit()
+        print(f"✅ Generated and saved activity codes for {total_coded} activities")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error generating activity codes: {e}")
+        db.session.rollback()
+        return False
+
+
+def build_enhanced_hierarchy_paths(schedule_id):
+    """
+    Build enhanced hierarchy paths with codes for display and navigation
+    """
+    try:
+        print("🌐 Building enhanced hierarchy paths with codes...")
+        
+        # Get all WBS items and activities
+        wbs_items = WBS.query.filter_by(schedule_id=schedule_id).all()
+        activities = Activity.query.filter_by(schedule_id=schedule_id).all()
+        
+        # Create WBS lookup map
+        wbs_map = {wbs.wbs_id: wbs for wbs in wbs_items}
+        
+        # Function to build WBS path with codes
+        def get_wbs_path_with_codes(wbs_id):
+            path_parts = []
+            current_wbs_id = wbs_id
+            visited = set()
+            
+            while current_wbs_id and current_wbs_id in wbs_map:
+                if current_wbs_id in visited:
+                    break
+                
+                visited.add(current_wbs_id)
+                wbs = wbs_map[current_wbs_id]
+                
+                if wbs.wbs_code:
+                    path_parts.append(f"{wbs.wbs_code} {wbs.wbs_name}")
+                else:
+                    path_parts.append(wbs.wbs_name or 'Unnamed WBS')
+                
+                current_wbs_id = wbs.parent_wbs_id
+            
+            return " > ".join(reversed(path_parts))
+        
+        # Update WBS full paths with codes
+        for wbs in wbs_items:
+            wbs.full_path = get_wbs_path_with_codes(wbs.wbs_id)
+        
+        # Update Activity hierarchy paths with codes
+        for activity in activities:
+            if activity.wbs_id and activity.wbs_id in wbs_map:
+                wbs_path = get_wbs_path_with_codes(activity.wbs_id)
+                activity_code = activity.activity_code or activity.task_id
+                activity.hierarchy_path = f"{wbs_path} > {activity_code} {activity.task_name}"
+            else:
+                activity_code = activity.activity_code or activity.task_id
+                activity.hierarchy_path = f"Unassigned > {activity_code} {activity.task_name}"
+        
+        # Save all updates to database
+        db.session.commit()
+        print(f"✅ Built enhanced hierarchy paths for {len(wbs_items)} WBS and {len(activities)} activities")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error building enhanced hierarchy paths: {e}")
+        db.session.rollback()
+        return False
+
+
+def add_new_activity_to_wbs(schedule_id, wbs_id, activity_data):
+    """
+    Add a new activity to a specific WBS with proper hierarchy code assignment
+    This function ensures new activities follow the existing code structure
+    """
+    try:
+        print(f"➕ Adding new activity to WBS {wbs_id}")
+        
+        # Get the WBS item
+        wbs = WBS.query.filter_by(schedule_id=schedule_id, wbs_id=wbs_id).first()
+        if not wbs or not wbs.wbs_code:
+            return False, "WBS not found or no WBS code assigned"
+        
+        # Find existing activities in this WBS
+        existing_activities = Activity.query.filter_by(
+            schedule_id=schedule_id, 
+            wbs_id=wbs_id
+        ).order_by(Activity.sort_order.desc()).all()
+        
+        # Determine next activity number
+        if existing_activities:
+            last_activity = existing_activities[0]
+            next_number = (last_activity.sort_order or 0) + 1
+        else:
+            next_number = 1
+        
+        # Generate activity code
+        new_activity_code = f"{wbs.wbs_code}.{next_number}"
+        
+        # Create new activity
+        new_activity = Activity(
+            schedule_id=schedule_id,
+            task_id=activity_data.get('task_id'),
+            task_name=activity_data.get('task_name'),
+            activity_code=new_activity_code,
+            wbs_id=wbs_id,
+            wbs_code=wbs.wbs_code,
+            sort_order=next_number,
+            # ... other activity fields
+        )
+        
+        db.session.add(new_activity)
+        db.session.commit()
+        
+        # Rebuild hierarchy path for this activity
+        build_enhanced_hierarchy_paths(schedule_id)
+        
+        print(f"✅ Added activity {new_activity_code} to WBS {wbs.wbs_code}")
+        return True, new_activity_code
+        
+    except Exception as e:
+        print(f"❌ Error adding new activity: {e}")
+        db.session.rollback()
+        return False, str(e)
+
 
 def create_app(config_class=Config):
     app = Flask(__name__)
@@ -686,7 +760,7 @@ def create_app(config_class=Config):
     @app.route('/api/projects', methods=['GET'])
     def get_projects():
         try:
-            print("🔍 API: Fetching projects...")
+            print("📋 API: Fetching projects...")
             projects = Project.query.all()
             print(f"✅ API: Found {len(projects)} projects")
             
@@ -702,7 +776,7 @@ def create_app(config_class=Config):
     @app.route('/api/projects', methods=['POST'])
     def create_project():
         try:
-            print("🔍 API: Creating project...")
+            print("📋 API: Creating project...")
             data = request.get_json()
             print(f"📝 API: Received data: {data}")
             
@@ -880,6 +954,39 @@ def create_app(config_class=Config):
             print(f"❌ API Error deleting schedule: {e}")
             return jsonify({'error': str(e)}), 500
     
+    @app.route('/api/schedules/<int:schedule_id>/export-xer', methods=['POST'])
+    def export_xer_endpoint(schedule_id):
+        """Export schedule to XER format via API"""
+        try:
+            schedule = Schedule.query.get_or_404(schedule_id)
+            
+            # Generate output filename
+            safe_name = "".join(c for c in schedule.name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            output_filename = f"{safe_name}_{schedule_id}.xer"
+            output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+            
+            # Export to XER
+            success, message = export_schedule_to_xer(schedule_id, output_path)
+            
+            if success:
+                return jsonify({
+                    'success': True,
+                    'message': 'Schedule exported successfully',
+                    'filename': output_filename,
+                    'path': output_path
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'error': message
+                }), 500
+                
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+
     # Test route
     @app.route('/test-create-project')
     def test_create():
@@ -898,131 +1005,64 @@ def create_app(config_class=Config):
     
 
     @app.route('/api/schedules/<int:schedule_id>/activities', methods=['GET'])
-    def get_schedule_activities(schedule_id):
-        """Get activities for a specific schedule with proper WBS hierarchy"""
+    def get_schedule_activities_with_hierarchy(schedule_id):
+        """Load ALL activities without pagination limits"""
         try:
-            # Verify schedule exists
             schedule = Schedule.query.get_or_404(schedule_id)
             
-            print(f"🔍 Fetching activities for schedule {schedule_id}: {schedule.name}")
-            
-            # Get pagination parameters
-            page = request.args.get('page', 1, type=int)
-            per_page = min(request.args.get('per_page', 1000, type=int), 2000)  # Increased limit
-            
-            # Get filter parameters
+            # Get filters
             search = request.args.get('search', '')
-            status = request.args.get('status', 'all')
+            status_filter = request.args.get('status', 'all')
             
-            # STEP 1: Get all activities for this schedule
-            print("📋 Fetching activities...")
-            activity_query = Activity.query.filter(Activity.schedule_id == schedule_id)
+            print(f"🔍 Loading ALL activities for schedule {schedule_id}")
             
-            # Apply search filter
+            # Build query with filters
+            query = Activity.query.filter(Activity.schedule_id == schedule_id)
+            
             if search:
-                activity_query = activity_query.filter(
+                query = query.filter(
                     db.or_(
                         Activity.task_id.ilike(f'%{search}%'),
-                        Activity.task_name.ilike(f'%{search}%')
+                        Activity.task_name.ilike(f'%{search}%'),
+                        Activity.task_code.ilike(f'%{search}%'),
+                        Activity.wbs_id.ilike(f'%{search}%'),
+                        Activity.hierarchy_path.ilike(f'%{search}%')
                     )
                 )
             
-            # Apply status filter
-            if status != 'all':
-                if status == 'Not Started':
-                    activity_query = activity_query.filter(Activity.progress_pct == 0)
-                elif status == 'In Progress':
-                    activity_query = activity_query.filter(
+            if status_filter != 'all':
+                if status_filter == 'not_started':
+                    query = query.filter(Activity.progress_pct == 0)
+                elif status_filter == 'in_progress':
+                    query = query.filter(
                         db.and_(Activity.progress_pct > 0, Activity.progress_pct < 100)
                     )
-                elif status == 'Completed':
-                    activity_query = activity_query.filter(Activity.progress_pct >= 100)
+                elif status_filter == 'completed':
+                    query = query.filter(Activity.progress_pct >= 100)
             
-            # Order by early start date, then by task_id
-            activity_query = activity_query.order_by(Activity.early_start_date.asc(), Activity.task_id.asc())
+            # ✅ GET ALL ACTIVITIES - NO PAGINATION
+            activities = query.order_by(
+                Activity.hierarchy_path.asc(),
+                Activity.early_start_date.asc().nullslast(), 
+                Activity.task_id.asc()
+            ).all()
             
-            # Execute paginated query
-            activities_paginated = activity_query.paginate(
-                page=page, 
-                per_page=per_page, 
-                error_out=False
-            )
-            
-            print(f"✅ Found {activities_paginated.total} total activities, showing {len(activities_paginated.items)}")
-            
-            # STEP 2: Get WBS structure for this schedule
-            print("📁 Fetching WBS structure...")
+            # Get WBS structure
             wbs_items = WBS.query.filter_by(schedule_id=schedule_id).all()
-            print(f"✅ Found {len(wbs_items)} WBS items")
             
-            # STEP 3: Get project information
-            project_info = {
-                'project_id': schedule.project.id if schedule.project else None,
-                'project_name': schedule.project.name if schedule.project else 'Unknown Project',
-                'schedule_name': schedule.name,
-                'schedule_id': schedule.id
-            }
+            print(f"✅ Loaded ALL {len(activities)} activities and {len(wbs_items)} WBS items")
             
-            # STEP 4: Format activities data
-            activities_data = []
-            for activity in activities_paginated.items:
-                activities_data.append({
-                    'task_id': activity.task_id,
-                    'task_name': activity.task_name or 'Unnamed Activity',
-                    'wbs_id': activity.wbs_id or '',
-                    'duration_days': float(activity.duration_days) if activity.duration_days else 0,
-                    'early_start_date': activity.early_start_date.isoformat() if activity.early_start_date else None,
-                    'early_end_date': activity.early_end_date.isoformat() if activity.early_end_date else None,
-                    'late_start_date': activity.late_start_date.isoformat() if activity.late_start_date else None,
-                    'late_end_date': activity.late_end_date.isoformat() if activity.late_end_date else None,
-                    'actual_start_date': activity.actual_start_date.isoformat() if activity.actual_start_date else None,
-                    'actual_end_date': activity.actual_end_date.isoformat() if activity.actual_end_date else None,
-                    'progress_pct': float(activity.progress_pct) if activity.progress_pct else 0,
-                    'total_float_days': float(activity.total_float_days) if activity.total_float_days else 0,
-                    'free_float_days': float(activity.free_float_days) if activity.free_float_days else 0,
-                    'task_type': activity.task_type,
-                    'status_code': activity.status_code
-                })
-            
-            # STEP 5: Format WBS structure data
-            wbs_structure = []
-            for wbs in wbs_items:
-                wbs_structure.append({
-                    'wbs_id': wbs.wbs_id,
-                    'wbs_name': wbs.wbs_name or f'WBS {wbs.wbs_id}',
-                    'parent_wbs_id': wbs.parent_wbs_id,
-                    'proj_id': project_info['project_id']  # Add project reference
-                })
-            
-            print(f"📊 Returning: {len(activities_data)} activities, {len(wbs_structure)} WBS items")
-            
+            # Return response without pagination info
             return jsonify({
                 'success': True,
-                'activities': activities_data,
-                'wbs_structure': wbs_structure,
-                'project_info': project_info,
-                'pagination': {
-                    'page': activities_paginated.page,
-                    'pages': activities_paginated.pages,
-                    'per_page': activities_paginated.per_page,
-                    'total': activities_paginated.total,
-                    'has_next': activities_paginated.has_next,
-                    'has_prev': activities_paginated.has_prev
-                }
+                'activities': [activity.to_dict() for activity in activities],
+                'wbs_structure': [wbs.to_dict() for wbs in wbs_items],
+                'total_loaded': len(activities)
             })
             
         except Exception as e:
-            print(f"❌ API Error getting activities: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({
-                'success': False,
-                'error': str(e),
-                'activities': [],
-                'wbs_structure': [],
-                'project_info': {},
-                'pagination': {'total': 0}
-            }), 500
+            print(f"❌ Error: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
         
     @app.route('/api/schedules/<int:schedule_id>/relationships', methods=['GET'])
     def get_schedule_relationships(schedule_id):

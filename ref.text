@@ -1,0 +1,14 @@
+## Backend
+
+cd backend
+source venv/Scripts/activate
+python run.py
+
+## Front end
+cd frontend
+../tools/node/npm.cmd run dev
+
+
+
+## Initiate or prepare or Update DB
+python init_db.py
